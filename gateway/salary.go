@@ -1,5 +1,7 @@
 package gateway
 
+import "github.com/sirupsen/logrus"
+
 // SalaryGateway is an interface to salary related resources
 type SalaryGateway interface {
 	FetchSalary(string) int
@@ -24,5 +26,10 @@ func NewSalaryInMemoryGateway() *SalaryInMemoryGateway {
 
 // FetchSalary fetches the salary for the user matching the id
 func (gw *SalaryInMemoryGateway) FetchSalary(id string) int {
-	return gw.salaries[id]
+	salary := gw.salaries[id]
+	logrus.WithFields(logrus.Fields{
+		"id":     id,
+		"salary": salary,
+	}).Info("Fetched salary")
+	return salary
 }
