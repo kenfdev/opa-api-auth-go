@@ -6,3 +6,12 @@ services:
     image: kenfdev/opa-api-auth-go
     ports:
       - 1323:1323
+    environment:
+      PDP_ENDPOINT: http://pdp:8181/v1/data/httpapi/authz/allow
+  pdp:
+    image: openpolicyagent/opa:0.12.0
+    ports:
+      - 8181:8181
+    volumes:
+      - ./opa:/etc/opt/opa
+    command: ["run", "--server", "/etc/opt/opa/authz.rego"]
