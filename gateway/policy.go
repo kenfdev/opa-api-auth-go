@@ -1,82 +1,103 @@
 package gateway
 
 import (
+	"bytes"
+	"encoding/json"
 	"github.com/dgrijalva/jwt-go"
-	"github.com/kenfdev/opa-api-auth-go/entity"
 	"github.com/labstack/echo"
 	"github.com/sirupsen/logrus"
-	"regexp"
+	"io/ioutil"
+	"net/http"
+	"strings"
 )
 
 type PolicyGateway interface {
 	Ask(echo.Context) bool
 }
 
-type PolicyLocalGateway struct {
-	getSalaryPathRegex *regexp.Regexp
+type opaRequest struct {
+	// Input wraps the OPA request (https://www.openpolicyagent.org/docs/latest/rest-api/#get-a-document-with-input)
+	Input *opaInput `json:"input"`
 }
 
-func NewPolicyLocalGateway() *PolicyLocalGateway {
-	return &PolicyLocalGateway{
-		getSalaryPathRegex: regexp.MustCompile("GET /finance/salary/.*"),
+type opaInput struct {
+	// The token of the requester
+	Token string `json:"token"`
+	// The path to which the request was made split to an array
+	Path []string `json:"path"`
+	// The HTTP Method
+	Method string `json:"method"`
+}
+
+type opaResponse struct {
+	Result bool `json:"result"`
+}
+
+// PolicyOpaGateway makes policy decision requests to OPA
+type PolicyOpaGateway struct {
+	endpoint string
+}
+
+func NewPolicyOpaGateway(endpoint string) *PolicyOpaGateway {
+	return &PolicyOpaGateway{
+		endpoint: endpoint,
 	}
 }
 
-// Ask checks if an action is permitted as it inspects the request context
-func (gw *PolicyLocalGateway) Ask(c echo.Context) bool {
-	path := c.Request().Method + " " + c.Path()
+// Ask requests to OPA with required inputs and returns the decision made by OPA
+func (gw *PolicyOpaGateway) Ask(c echo.Context) bool {
+	token := c.Get("token").(*jwt.Token)
+	// After splitting, the first element isn't necessary
+	// "/finance/salary/alice" -> ["", "finance", "salary", "alice"]
+	paths := strings.Split(c.Request().RequestURI, "/")[1:]
+	method := c.Request().Method
 
-	raw := c.Get("token").(*jwt.Token)
-	claims := raw.Claims.(*entity.TokenClaims)
-
-	var allow = false
-	switch {
-	case gw.getSalaryPathRegex.MatchString(path):
-		allow = gw.checkGETSalary(c, claims)
+	// create input to send to OPA
+	input := &opaInput{
+		Token:  token.Raw,
+		Path:   paths,
+		Method: method,
+	}
+	opaRequest := &opaRequest{
+		Input: input,
 	}
 
-	return allow
-}
-
-func (gw *PolicyLocalGateway) checkGETSalary(c echo.Context, claims *entity.TokenClaims) bool {
-	userID := c.Param("id")
 	logrus.WithFields(logrus.Fields{
-		"userID": userID,
-		"claims": claims,
-	}).Info("Checking GET salary policies")
+		"token":  input.Token,
+		"path":   input.Path,
+		"method": input.Method,
+	}).Info("Requesting PDP for decision")
 
-	if yes := gw.checkIfOwner(userID, claims); yes {
-		logrus.Info("Allowing because requester is the owner")
-		return true
+	requestBody, err := json.Marshal(opaRequest)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Marshalling request body failed")
+		return false
 	}
 
-	if yes := gw.checkIfSubordinate(userID, claims); yes {
-		logrus.Info("Allowing because target is a subordinate of requester")
-		return true
+	// request OPA
+	resp, err := http.Post(gw.endpoint, "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("PDP Request failed")
+		return false
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Reading body of response failed")
+		return false
 	}
 
-	if yes := gw.checkIfHR(claims); yes {
-		logrus.Info("Allowing because requester is a member of HR")
-		return true
+	var opaResponse opaResponse
+	err = json.Unmarshal(body, &opaResponse)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"error": err}).Error("Unmarshalling response body failed")
+		return false
 	}
 
-	logrus.Info("Denying request")
-	return false
-}
+	logrus.WithFields(logrus.Fields{
+		"result": opaResponse.Result,
+	}).Info("Decision")
 
-func (*PolicyLocalGateway) checkIfOwner(userID string, claims *entity.TokenClaims) bool {
-	return userID == claims.User
-}
-
-func (*PolicyLocalGateway) checkIfSubordinate(userID string, claims *entity.TokenClaims) bool {
-	for _, subordinate := range claims.Subordinates {
-		if subordinate == userID {
-			return true
-		}
-	}
-	return false
-}
-
-func (*PolicyLocalGateway) checkIfHR(claims *entity.TokenClaims) bool {
-	return claims.BelongsToHR
+	return opaResponse.Result
 }
